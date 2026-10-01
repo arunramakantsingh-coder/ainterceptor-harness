@@ -1,0 +1,158 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AInterceptor Harness</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { margin:0; font: 14px/1.5 ui-sans-serif, system-ui, "Segoe UI", sans-serif;
+         background:#0b0d10; color:#e6edf3; }
+  header { display:flex; align-items:center; gap:14px; padding:12px 18px;
+           border-bottom:1px solid #1f242c; background:#0e1116; position:sticky; top:0; z-index:5; }
+  header h1 { font-size:15px; margin:0; font-weight:650; letter-spacing:.2px; }
+  header .badge { font-size:11px; padding:3px 9px; border-radius:11px; background:#11202e;
+                  border:1px solid #1d4ed8; color:#93c5fd; }
+  nav { display:flex; gap:4px; margin-left:auto; }
+  nav button { background:transparent; border:1px solid transparent; color:#9aa4b2;
+               padding:6px 12px; border-radius:7px; cursor:pointer; font:inherit; }
+  nav button:hover { color:#e6edf3; background:#151a21; }
+  nav button.on { color:#fff; background:#161d26; border-color:#2b3542; }
+  main { padding:18px; max-width:1180px; margin:0 auto; }
+  section { display:none; } section.on { display:block; }
+  h2 { font-size:13px; text-transform:uppercase; letter-spacing:.7px; color:#8b949e;
+       margin:22px 0 10px; font-weight:650; }
+  h2:first-child { margin-top:4px; }
+  .card { border:1px solid #1f242c; border-radius:9px; background:#0e1116; padding:14px; margin-bottom:10px; }
+  .row { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
+  input, select, textarea { background:#0b0d10; color:#e6edf3; border:1px solid #262d38;
+                            border-radius:7px; padding:8px 11px; font:inherit; }
+  input:focus, textarea:focus { outline:none; border-color:#1d4ed8; }
+  button.act { background:#1f6feb; border:0; color:#fff; padding:8px 14px; border-radius:7px;
+               cursor:pointer; font:inherit; font-weight:550; }
+  button.act:hover { background:#2b7cf0; }
+  button.act:disabled { background:#2a3240; color:#7d8794; cursor:not-allowed; }
+  button.ghost { background:#151a21; border:1px solid #262d38; color:#c9d1d9; padding:8px 13px;
+                 border-radius:7px; cursor:pointer; font:inherit; }
+  .pill { font-size:11px; font-weight:700; padding:2px 8px; border-radius:10px; letter-spacing:.4px; }
+  .PASS { background:#0f2d1a; color:#4ade80; border:1px solid #14532d; }
+  .WARN { background:#2d2408; color:#fbbf24; border:1px solid #713f12; }
+  .FAIL { background:#2d0f0f; color:#f87171; border:1px solid #7f1d1d; }
+  pre { background:#0b0d10; border:1px solid #1f242c; border-radius:8px; padding:11px;
+        overflow:auto; font-size:12px; max-height:420px; margin:10px 0 0;
+        font-family:ui-monospace, SFMono-Regular, Menlo, monospace; white-space:pre-wrap; }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  th, td { text-align:left; padding:7px 9px; border-bottom:1px solid #1a1f27; vertical-align:top; }
+  th { color:#8b949e; font-weight:600; font-size:11.5px; text-transform:uppercase; letter-spacing:.4px; }
+  code { font-family:ui-monospace, monospace; background:#151a21; padding:1px 5px; border-radius:4px; font-size:12px; }
+  .muted { color:#7d8794; font-size:12.5px; }
+  .tree { font-family:ui-monospace, monospace; font-size:12.5px; max-height:460px; overflow:auto; }
+  .tree .d { color:#7dd3fc; } .tree .f { color:#c9d1d9; }
+  .tree div { padding:1px 0; white-space:pre; }
+  .msgs { display:flex; flex-direction:column; gap:9px; max-height:440px; overflow:auto; margin-bottom:10px; }
+  .msg { border:1px solid #1f242c; border-radius:8px; padding:9px 12px; white-space:pre-wrap; }
+  .msg.user { background:#111826; border-color:#1e3a8a; }
+  .msg.assistant { background:#0e1116; }
+  .msg.error { background:#1c1010; border-color:#7f1d1d; color:#fca5a5; }
+  .err { color:#f87171; }
+  .grid2 { display:grid; grid-template-columns:repeat(auto-fit,minmax(230px,1fr)); gap:9px; }
+  .kv { font-size:12.5px; } .kv b { color:#8b949e; font-weight:600; }
+</style>
+</head>
+<body>
+<header>
+  <h1>AInterceptor Harness</h1>
+  <span class="badge" id="backendBadge">backend: checking…</span>
+  <nav>
+    <button data-tab="diag" class="on">Diagnostics</button>
+    <button data-tab="hosts">Hosts</button>
+    <button data-tab="ws">Workspaces</button>
+    <button data-tab="chat">Agent</button>
+    <button data-tab="events">Events</button>
+  </nav>
+</header>
+
+<main>
+  <!-- Diagnostics -->
+  <section id="tab-diag" class="on">
+    <h2>Self-diagnostics</h2>
+    <div class="row" style="margin-bottom:10px">
+      <button class="act" id="runDiag">Run checks</button>
+      <button class="ghost" id="runDiagFresh">Re-probe hosts</button>
+      <span class="muted" id="diagWhen"></span>
+    </div>
+    <div id="diagOut"><p class="muted">Not run yet.</p></div>
+  </section>
+
+  <!-- Hosts -->
+  <section id="tab-hosts">
+    <h2>Execution hosts</h2>
+    <div class="row" style="margin-bottom:10px">
+      <button class="act" id="loadHosts">Load inventory</button>
+      <button class="ghost" id="loadHostsFresh">Re-probe</button>
+    </div>
+    <div id="hostsOut"><p class="muted">Not loaded yet.</p></div>
+
+    <h2>Run a command</h2>
+    <div class="card">
+      <div class="row">
+        <select id="execTarget"></select>
+        <input id="execCmd" style="flex:1; min-width:280px" placeholder="e.g. uname -a">
+        <button class="act" id="execRun">Run</button>
+      </div>
+      <pre id="execOut" hidden></pre>
+    </div>
+  </section>
+
+  <!-- Workspaces -->
+  <section id="tab-ws">
+    <h2>Workspaces</h2>
+    <div class="card">
+      <div class="row">
+        <input id="wsPath" style="flex:1; min-width:300px" placeholder="absolute path to a project directory">
+        <select id="wsHost"></select>
+        <button class="act" id="wsOpen">Open</button>
+      </div>
+      <p class="muted" style="margin:8px 0 0">The tree below is the real filesystem, not a mock.</p>
+    </div>
+    <div id="wsList"></div>
+    <div id="wsDetail"></div>
+  </section>
+
+  <!-- Agent -->
+  <section id="tab-chat">
+    <h2>Agent</h2>
+    <div class="card">
+      <div class="row" style="margin-bottom:10px">
+        <span class="muted">Provider</span>
+        <select id="chatModel" style="min-width:190px"></select>
+        <button class="ghost" id="loadProviders">Refresh providers</button>
+        <span class="muted" id="providerNote"></span>
+      </div>
+      <div class="msgs" id="chatLog"></div>
+      <div class="row">
+        <textarea id="chatInput" rows="3" style="flex:1; min-width:300px"
+                placeholder="Ask the agent. Every reply is produced by AInterceptor, never by a provider SDK."></textarea>
+        <button class="act" id="chatSend">Send</button>
+      </div>
+      <p class="muted" style="margin:9px 0 0">
+        Provider choice is AInterceptor's job. <code>auto</code> lets it route.
+      </p>
+    </div>
+  </section>
+
+  <!-- Events -->
+  <section id="tab-events">
+    <h2>Structured events</h2>
+    <div class="row" style="margin-bottom:10px">
+      <button class="act" id="loadEvents">Refresh</button>
+      <span class="muted">Every line passed the redaction stage before being written.</span>
+    </div>
+    <div id="eventsOut"><p class="muted">Not loaded yet.</p></div>
+  </section>
+</main>
+
+<script src="/app.js"></script>
+</body>
+</html>

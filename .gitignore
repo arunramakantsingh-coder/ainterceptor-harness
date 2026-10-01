@@ -1,0 +1,15 @@
+# Secrets — never commit. The credentials seam resolves references to these at
+# runtime; nothing here is ever read into settings or logged.
+.credentials/
+*.key
+*.pem
+.env
+.env.*
+!*.example
+
+# Harness runtime state
+logs/
+events-*.jsonl
+workspaces.json
+node_modules/
+*.tsbuildinfo
