@@ -14,6 +14,7 @@ import type { HarnessConfig, HostTarget } from "../config.ts";
 import type { EventSink } from "../events.ts";
 import { sessionEmitter } from "../events.ts";
 import { Executor } from "../exec/executor.ts";
+import { buildLocalProbeCommand } from "./local-probe-cmd.ts";
 
 export type Verdict = "PASS" | "WARN" | "FAIL";
 
@@ -262,25 +263,15 @@ export class HostInventory {
 }
 
 /**
- * Windows local probe. Kept separate because the remote probe is bash; the
- * harness host is Windows, so it needs its own read-only script.
+ * Windows local probe.
+ *
+ * Delegates to the Node binary that is already running the harness, so the
+ * report describes the real machine regardless of which shell exists. This is
+ * deliberately not a PowerShell script: `pwsh` (PowerShell 7) is absent on this
+ * host (only Windows PowerShell 5.1), and quoting an absolute Windows path
+ * through PowerShell's `-Command` broke the probe with `Unexpected token`.
  */
-const LOCAL_WINDOWS_PROBE = `
-$ErrorActionPreference='SilentlyContinue'
-"hostname=$env:COMPUTERNAME"
-"os=$((Get-CimInstance Win32_OperatingSystem).Caption)"
-"kernel=$([System.Environment]::OSVersion.VersionString)"
-"arch=$env:PROCESSOR_ARCHITECTURE"
-"cpu_cores=$env:NUMBER_OF_PROCESSORS"
-"cpu_model=$((Get-CimInstance Win32_Processor | Select-Object -First 1).Name)"
-"disk=$((Get-PSDrive C | ForEach-Object { '{0:N1} GB free' -f ($_.Free/1GB) }))"
-"addr4=local=$((Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.IPAddress -notlike '127.*' } | Select-Object -First 3 -ExpandProperty IPAddress) -join ',')"
-foreach ($t in @('git','python','node','npm','docker','curl','ssh')) {
-  $c = Get-Command $t -ErrorAction SilentlyContinue
-  if ($c) { "cap_$t=$($c.Source)" } else { "cap_$t=" }
-}
-"PROBE_END"
-`.trim();
+const LOCAL_WINDOWS_PROBE = buildLocalProbeCommand();
 
 function parseWindowsProbe(text: string): {
   identity: HostCapabilities["identity"];
@@ -289,35 +280,86 @@ function parseWindowsProbe(text: string): {
   caps: Capability[];
   notes: string[];
 } {
-  const kv = new Map<string, string>();
-  for (const line of text.split(/\r?\n/)) {
-    const m = /^([a-z0-9_]+)=(.*)$/i.exec(line.trim());
-    if (m) kv.set(m[1], m[2]);
-  }
-  const caps: Capability[] = [];
-  for (const [k, v] of kv.entries()) {
-    if (k.startsWith("cap_")) caps.push({ name: k.slice(4), present: Boolean(v), evidence: v });
-  }
   const notes: string[] = [];
-  if (!caps.find((c) => c.name === "pnpm")?.present) notes.push("pnpm not installed");
-  return {
-    identity: {
-      hostname: kv.get("hostname"),
-      os: kv.get("os"),
-      kernel: kv.get("kernel"),
-      arch: kv.get("arch"),
-    },
-    resources: {
-      cpuCores: Number(kv.get("cpu_cores")) || undefined,
-      cpuModel: kv.get("cpu_model"),
-      diskFree: kv.get("disk"),
-    },
-    network: {
-      addresses: (kv.get("addr4") ?? "").split(",").map((s) => s.trim()).filter(Boolean),
-    },
-    caps,
-    notes,
-  };
+
+  // The local probe emits one JSON object (see hosts/local-probe.ts).
+  try {
+    const j = JSON.parse(text.trim().split(/\r?\n/).filter(Boolean).pop() ?? "{}") as {
+      hostname?: string;
+      os?: string;
+      kernel?: string;
+      arch?: string;
+      uptime?: string;
+      cpuCores?: number;
+      cpuModel?: string;
+      memTotalMb?: number;
+      memAvailMb?: number;
+      addr4?: string[];
+      caps?: Record<string, string>;
+    };
+
+    const caps: Capability[] = Object.entries(j.caps ?? {}).map(([name, evidence]) => ({
+      name,
+      present: Boolean(evidence),
+      evidence: evidence || "",
+    }));
+
+    if (!caps.find((c) => c.name === "pnpm")?.present) notes.push("pnpm not installed");
+    if (j.memAvailMb !== undefined && j.memTotalMb !== undefined && j.memTotalMb > 0) {
+      const ratio = j.memAvailMb / j.memTotalMb;
+      if (ratio < 0.15) {
+        notes.push(`memory pressure: only ${j.memAvailMb} MB of ${j.memTotalMb} MB available`);
+      }
+    }
+
+    return {
+      identity: {
+        hostname: j.hostname,
+        os: j.os,
+        kernel: j.kernel,
+        arch: j.arch,
+        uptime: j.uptime,
+      },
+      resources: {
+        cpuCores: j.cpuCores,
+        cpuModel: j.cpuModel,
+        memTotalMb: j.memTotalMb,
+        memAvailableMb: j.memAvailMb,
+      },
+      network: { addresses: j.addr4 ?? [] },
+      caps,
+      notes,
+    };
+  } catch {
+    // Fall back to the key=value shape so an older probe still parses.
+    const kv = new Map<string, string>();
+    for (const line of text.split(/\r?\n/)) {
+      const m = /^([a-z0-9_]+)=(.*)$/i.exec(line.trim());
+      if (m) kv.set(m[1], m[2]);
+    }
+    const caps: Capability[] = [];
+    for (const [k, v] of kv.entries()) {
+      if (k.startsWith("cap_")) caps.push({ name: k.slice(4), present: Boolean(v), evidence: v });
+    }
+    return {
+      identity: {
+        hostname: kv.get("hostname"),
+        os: kv.get("os"),
+        kernel: kv.get("kernel"),
+        arch: kv.get("arch"),
+      },
+      resources: {
+        cpuCores: Number(kv.get("cpu_cores")) || undefined,
+        cpuModel: kv.get("cpu_model"),
+        diskFree: kv.get("disk"),
+      },
+      network: {
+        addresses: (kv.get("addr4") ?? "").split(",").map((s) => s.trim()).filter(Boolean),
+      },
+      caps,
+      notes,
+    };
+  }
 }
 
 /** Aggregate verdict from a set of checks. FAIL dominates, then WARN. */

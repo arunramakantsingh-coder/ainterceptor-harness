@@ -137,26 +137,51 @@ export class WorkspaceStore {
   /**
    * Register (or return the existing) workspace for a directory.
    *
-   * The path is canonicalised with realpath, so `C:\a\link` and `C:\a\real`
-   * resolve to one workspace. A non-existent path is an error - we never
-   * invent a workspace for a directory that is not there.
+   * Identity is the CANONICAL path. For a local target we canonicalise with
+   * Node's realpath, so `C:\a\link` and `C:\a\real` resolve to one workspace.
+   * For a REMOTE target the path must be canonicalised on that machine instead
+   * - validating it against the host filesystem is wrong and made every remote
+   * workspace fail with "path does not exist or is not readable".
+   *
+   * A non-existent path is always an error: we never invent a workspace for a
+   * directory that is not there.
    */
   async open(inputPath: string, host = "local"): Promise<Workspace> {
     await this.load();
-    const expanded = inputPath.startsWith("~")
-      ? path.join(os.homedir(), inputPath.slice(1).replace(/^[/\\]/, ""))
-      : inputPath;
+    const target = this.executor.host(host);
+    const isLocal = target.transport === "local";
 
     let canonical: string;
-    try {
-      canonical = await realpath(path.resolve(expanded));
-    } catch {
-      throw new Error(`path does not exist or is not readable: ${expanded}`);
-    }
-
-    const st = await stat(canonical).catch(() => undefined);
-    if (!st?.isDirectory()) {
-      throw new Error(`not a directory: ${canonical}`);
+    if (isLocal) {
+      const expanded = inputPath.startsWith("~")
+        ? path.join(os.homedir(), inputPath.slice(1).replace(/^[/\\]/, ""))
+        : inputPath;
+      try {
+        canonical = await realpath(path.resolve(expanded));
+      } catch {
+        throw new Error(`path does not exist or is not readable: ${expanded}`);
+      }
+      const st = await stat(canonical).catch(() => undefined);
+      if (!st?.isDirectory()) {
+        throw new Error(`not a directory: ${canonical}`);
+      }
+    } else {
+      // Ask the remote host to canonicalise and confirm it is a directory.
+      // `cd -P` resolves symlinks; `pwd -P` then prints the physical path.
+      // The remote shell is bash, and the path is passed as a single-quoted
+      // literal so nothing is expanded.
+      const quoted = `'${inputPath.replace(/'/g, `'\\''`)}'`;
+      const res = await this.executor.run({
+        target: host,
+        command: `if [ ! -d ${quoted} ]; then echo "__MISSING__"; else cd -P ${quoted} && pwd -P; fi`,
+        permission: "read",
+        timeoutMs: 30_000,
+      });
+      const out = res.stdout.trim().split(/\r?\n/).filter(Boolean).pop() ?? "";
+      if (res.exitCode !== 0 || !out || out === "__MISSING__") {
+        throw new Error(`path does not exist or is not a directory on ${host}: ${inputPath}`);
+      }
+      canonical = out;
     }
 
     const existing = this.registry.workspaces.find((w) => w.root === canonical);
@@ -208,10 +233,18 @@ export class WorkspaceStore {
    */
   async tree(
     root: string,
-    opts: { depth?: number; maxEntries?: number } = {},
+    opts: { depth?: number; maxEntries?: number; host?: string } = {},
   ): Promise<{ tree: TreeNode[]; stats: { files: number; dirs: number; truncated: boolean } }> {
     const maxDepth = opts.depth ?? 3;
     const maxEntries = opts.maxEntries ?? 4000;
+    const hostId = opts.host ?? "local";
+
+    // A remote workspace's files live on that machine, so a local readdir
+    // would be meaningless. Ask the remote host to enumerate instead.
+    if (this.executor.host(hostId).transport !== "local") {
+      return this.remoteTree(root, hostId, maxDepth, maxEntries);
+    }
+
     const stats = { files: 0, dirs: 0, truncated: false };
 
     const walk = async (abs: string, rel: string, depth: number): Promise<TreeNode[]> => {
@@ -271,58 +304,68 @@ export class WorkspaceStore {
   }
 
   /**
-   * Read-only git facts. Runs in the workspace root so relative paths behave.
+   * Read-only git facts.
+   *
+   * Shell-agnostic on purpose. The first version used a bash script with
+   * `if/then/fi` and `$( )`, which silently produced `isRepo:false` on Windows
+   * because the local transport is PowerShell 5.1 - it has no `&&` and no bash
+   * conditionals. Instead we run each git command separately and use `git -C`
+   * so no `cd`/`&&` chaining is required on any platform.
+   *
    * Every command here is non-mutating.
    */
   async git(root: string, host = "local"): Promise<GitStatus> {
-    const script = [
-      "set -u",
-      'if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then echo "ISREPO=0"; exit 0; fi',
-      'echo "ISREPO=1"',
-      'echo "BRANCH=$(git branch --show-current 2>/dev/null)"',
-      'echo "HEAD=$(git rev-parse --short HEAD 2>/dev/null)"',
-      'echo "COUNTS=$(git rev-list --left-right --count @{upstream}...HEAD 2>/dev/null || echo "")"',
-      'echo "CHANGES_BEGIN"',
-      "git status --porcelain=v1 2>/dev/null | head -100",
-      'echo "CHANGES_END"',
-    ].join("\n");
+    const q = (s: string): string => `"${s.replace(/"/g, '\\"')}"`;
+
+    const run = async (gitArgs: string[]): Promise<{ code: number | null; out: string }> => {
+      try {
+        const res = await this.executor.run({
+          target: host,
+          command: `git -C ${q(root)} ${gitArgs.join(" ")}`,
+          permission: "read",
+          timeoutMs: 30_000,
+        });
+        return { code: res.exitCode, out: `${res.stdout}${res.stderr ? "\n" + res.stderr : ""}` };
+      } catch (err) {
+        return { code: 1, out: err instanceof Error ? err.message : String(err) };
+      }
+    };
 
     try {
-      const res = await this.executor.run({
-        target: host,
-        command: script,
-        cwd: root,
-        permission: "read",
-        timeoutMs: 30_000,
-      });
-      if (res.exitCode !== 0) {
-        return { isRepo: false, changes: [], error: res.stderr.slice(0, 200) };
+      const inside = await run(["rev-parse", "--is-inside-work-tree"]);
+      if (inside.code !== 0 || !/true/i.test(inside.out)) {
+        return {
+          isRepo: false,
+          changes: [],
+          error: inside.code === 0 ? undefined : inside.out.trim().slice(0, 200),
+        };
       }
-      const out = res.stdout;
-      if (/^ISREPO=0$/m.test(out)) return { isRepo: false, changes: [] };
 
-      const grab = (k: string): string | undefined => {
-        const m = new RegExp(`^${k}=(.*)$`, "m").exec(out);
-        return m?.[1]?.trim() || undefined;
-      };
-      const changes = (/CHANGES_BEGIN\n([\s\S]*?)\nCHANGES_END/.exec(out)?.[1] ?? "")
+      const [branch, head, counts, status] = await Promise.all([
+        run(["branch", "--show-current"]),
+        run(["rev-parse", "--short", "HEAD"]),
+        run(["rev-list", "--left-right", "--count", "@{upstream}...HEAD"]),
+        run(["status", "--porcelain=v1"]),
+      ]);
+
+      const changes = status.out
         .split(/\r?\n/)
         .map((s) => s.trimEnd())
-        .filter(Boolean);
+        .filter((s) => s.length > 0)
+        .slice(0, 200);
 
-      const counts = grab("COUNTS");
       let ahead: number | undefined;
       let behind: number | undefined;
-      if (counts) {
-        const [b, a] = counts.split(/\s+/).map((n) => Number(n));
-        if (Number.isFinite(b)) behind = b;
-        if (Number.isFinite(a)) ahead = a;
+      const cm = /^(\d+)\s+(\d+)/m.exec(counts.out.trim());
+      if (cm) {
+        behind = Number(cm[1]);
+        ahead = Number(cm[2]);
       }
 
       return {
         isRepo: true,
-        branch: grab("BRANCH"),
-        head: grab("HEAD"),
+        branch: branch.out.trim() || undefined,
+        head: head.out.trim() || undefined,
         ahead,
         behind,
         changes,
@@ -337,10 +380,75 @@ export class WorkspaceStore {
     }
   }
 
+  /**
+   * Enumerate a remote workspace with `find`, which is present on the Debian
+   * target and needs no Node on the far side. Output is one line per entry:
+   *   <type> <depth> <size> <relpath>
+   * and we rebuild the nested TreeNode shape from the depth field.
+   */
+  private async remoteTree(
+    root: string,
+    host: string,
+    maxDepth: number,
+    maxEntries: number,
+  ): Promise<{ tree: TreeNode[]; stats: { files: number; dirs: number; truncated: boolean } }> {
+    const stats = { files: 0, dirs: 0, truncated: false };
+    const quoted = `'${root.replace(/'/g, `'\\''`)}'`;
+
+    // -printf is a GNU find extension; the VM is Debian, so it is available.
+    const res = await this.executor.run({
+      target: host,
+      command:
+        `find ${quoted} -mindepth 1 -maxdepth ${maxDepth + 1} ` +
+        `\\( -name .git -o -name node_modules -o -name .venv -o -name __pycache__ -o -name .next \\) -prune -o ` +
+        `-printf '%y %d %s %P\\n' 2>/dev/null | head -${maxEntries}`,
+      permission: "read",
+      timeoutMs: 45_000,
+    });
+
+    type Row = { type: "f" | "d"; depth: number; size: number; rel: string };
+    const rows: Row[] = [];
+    for (const line of res.stdout.split(/\r?\n/)) {
+      const m = /^([fd]) (\d+) (\d+) (.*)$/.exec(line.trim());
+      if (!m) continue;
+      rows.push({ type: m[1] as "f" | "d", depth: Number(m[2]), size: Number(m[3]), rel: m[4] });
+    }
+    if (rows.length >= maxEntries) stats.truncated = true;
+
+    // rows are in find's pre-order; depth tells us where to attach each node
+    const rootNodes: TreeNode[] = [];
+    const stack: Array<{ depth: number; node: TreeNode }> = [];
+
+    for (const r of rows) {
+      const name = r.rel.split("/").pop() ?? r.rel;
+      const node: TreeNode =
+        r.type === "d"
+          ? { name, rel: r.rel, type: "dir", children: [] }
+          : { name, rel: r.rel, type: "file", size: r.size };
+
+      if (r.type === "d") stats.dirs++;
+      else stats.files++;
+
+      while (stack.length && stack[stack.length - 1].depth >= r.depth) stack.pop();
+      if (stack.length === 0) {
+        rootNodes.push(node);
+      } else {
+        const parent = stack[stack.length - 1].node;
+        (parent.children ??= []).push(node);
+      }
+      if (r.type === "d") stack.push({ depth: r.depth, node });
+    }
+
+    return { tree: rootNodes, stats };
+  }
+
   async detail(id: string): Promise<WorkspaceDetail | undefined> {
     const ws = await this.get(id);
     if (!ws) return undefined;
-    const [treeRes, git] = await Promise.all([this.tree(ws.root), this.git(ws.root, ws.host)]);
+    const [treeRes, git] = await Promise.all([
+      this.tree(ws.root, { host: ws.host }),
+      this.git(ws.root, ws.host),
+    ]);
     return { workspace: ws, git, tree: treeRes.tree, treeStats: treeRes.stats };
   }
 }
