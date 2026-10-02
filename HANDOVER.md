@@ -77,30 +77,100 @@ Transport used, all verified:
 
 ## 4. Provider sessions — the real story
 
-**The single shared Chrome profile is the root of most provider trouble.** All providers
-share one profile, so `ctx.storage_state()` captures **every** provider's cookies at once.
+### 4a. VERIFIED: `airouter-agent login <provider>` works, and injection works
 
-**Proven bug (now fixed):** `path_a._cookies()` flattened the whole jar with no domain
-filter, so every direct-HTTP request carried ~258 cookies. Measured on the real exports:
-deepseek had **259 cookies / 35,302 bytes**, of which exactly **one** (`ds_session_id`,
-45 bytes) belonged to `chat.deepseek.com`. Providers answered
-`400 Request Header Or Cookie Too Large` (openresty).
+Confirmed by inspecting the upload response's `injected` field (the part nobody
+had looked at):
 
-**Fixes applied** (backups kept as `*.pre_cookiefix`, `*.pre_idbfix`):
-- `path_a._cookies(state, host)` now filters by RFC-6265 domain match (exact, or suffix on
-  a dot boundary), with a no-host fallback so nothing is silently dropped.
+```
+device token sk-dev-mwllsKqDI… -> authenticated (200)
+admin  token sk-aint-0Lcs…     -> authenticated (200)
+POST /api/sessions/upload (device token)
+  http=200
+  injected={"ok":true,"cookies":1,"local_storage":0,"reload_error":null}
+```
+
+So the session IS pushed into the live Chrome tab. The `_is_admin(user)` gate in
+`sessions_routes.py` does not block it, because `AINTERCEPTOR_ADMIN_EMAIL` is set
+to `arunramakantsingh@gmail.com` and that is the account the tokens map to.
+**A session stored and injected is not the same as a session that works** — see 4c.
+
+### 4b. VERIFIED WORKING: gemini
+
+After `airouter-agent login gemini`, `/v1/chat/completions` with `model=gemini`
+returned **HTTP 200 `PONG`** and the path trace recorded `gemini B OK` (47.8 s),
+resolving to a real conversation URL (`/app/d2812a3291f1f635`, titled
+"A Simple Ping-Pong Exchange").
+
+### 4c. THE ACTUAL BLOCKER: Cloudflare binds the session to the browser that made it
+
+The VM's own browser tabs are serving challenge pages:
+
+```
+DeepSeek - Into the Unknown       https://chat.deepseek.com/
+Just a moment...                  https://claude.ai/api/challenge_redirect?to=…   <-- CHALLENGE
+A Simple Ping-Pong Exchange       https://gemini.google.com/app/d2812a3291f1f635
+Just a moment...                  https://chatgpt.com/                            <-- CHALLENGE
+```
+
+Path A (`path_a.py`) replays cookies over plain HTTP with **no browser involved**.
+Cloudflare's `cf_clearance` is bound to the browser fingerprint, the IP and the TLS
+signature that obtained it, so a cookie captured on your laptop does not clear a
+challenge for the VM. The VM's public IP is `106.213.87.162`; the session was
+minted on the host. That mismatch is the wall.
+
+Observed consequence, same minute, same code:
+
+| provider | result |
+|---|---|
+| gemini | `200 PONG` (green path, no challenge) |
+| chatgpt | `500 Internal Server Error` (after copying the fresh 129 KB session) |
+| deepseek | `503 A: …produced no text \| B: …` |
+| claude | `503 claude: produced no text` |
+
+Also note: the VM's chatgpt/claude tabs stay challenged, so Path B has nothing
+logged-in to drive either. **No amount of code fixes this** — a human has to clear
+the challenge once in the VM's Chrome, after which the persistent profile keeps it.
+
+### 4d. FIXED EARLIER: the cookie bloat that broke Path A
+
+All providers share one Chrome profile, so `ctx.storage_state()` captured every
+provider's cookies. `path_a._cookies()` flattened the whole jar with no domain
+filter, so each request carried ~258 cookies. Measured: deepseek had **259 cookies
+/ 35,302 bytes**, of which exactly **one** (`ds_session_id`, 45 bytes) belonged to
+`chat.deepseek.com`. Providers answered `400 Request Header Or Cookie Too Large`.
+
+Fixes applied (backups: `*.pre_cookiefix`, `*.pre_idbfix`):
+- `path_a._cookies(state, host)` filters by RFC-6265 domain match (exact, or suffix
+  on a dot boundary), with a no-host fallback so nothing is silently dropped.
   6 provider call sites patched; 1 left on the fallback.
-- `session_exporter.py` gained `_filter_cookies_for()` so future captures are clean at source.
-- `path_a._token_from_state()` now reads the **`indexeddb`** key (the exporter writes that,
-  but the code only looked for `_ainterceptor_idb`), and accepts long non-JWT session tokens.
+- `session_exporter.py` gained `_filter_cookies_for()` so captures are clean at source.
+- `path_a._token_from_state()` now reads the **`indexeddb`** key (the exporter writes
+  that, but the code only looked for `_ainterceptor_idb`) and accepts long non-JWT
+  session tokens (`settingsJwt` is 412 chars and is not JWT-shaped).
 
-**Remaining truth about deepseek:** after the fix the error became a well-formed
-`deepseek HTTP 400`, so the header-size bug is gone — but the **session itself is stale**.
-Its IndexedDB stores are empty (`deepseek-chat/history-message: rows=0`) and the only
-token-shaped localStorage value is 133 chars (the `__tea_cache_tokens` entry), not a
-session JWT. A stale session cannot be repaired by code; it needs a fresh login.
+After that fix deepseek's error became a well-formed `deepseek HTTP 400`, proving
+the header-size bug was gone. It still does not answer, because of 4c.
+
+### 4e. Session rows are keyed by USER — watch for duplicates
+
+`/v1` resolves a session by the **caller's user id**. Two accounts had rows:
+
+```
+chatgpt  arunrsingh@outlook.com        129,492 B   <-- the fresh login
+chatgpt  arunramakantsingh@gmail.com    38,978 B   <-- what /v1 read
+claude   arunrsingh@outlook.com         26,820 B
+claude   arunramakantsingh@gmail.com   875,912 B
+deepseek arunramakantsingh@gmail.com    54,568 B
+gemini   arunramakantsingh@gmail.com    14,530 B
+```
+
+`vm_sync_freshest.sh` copies the largest (freshest) blob per provider onto the
+admin key's user. That is a repair, not a cure — the root fix is for the agent's
+device token to belong to the same account you call `/v1` with.
 
 ### The login path (use this)
+
 `airouter-agent` is installed on the **host** (from `C:\Projects\AInterceptor-M1.5`):
 
 ```powershell
