@@ -63,8 +63,9 @@ ainterceptor:
 | `GET /health` from host (tailnet IP) | 200 |
 | `GET /health` from host (MagicDNS `ainterceptor`) | 200 |
 | `GET /health` via Funnel `https://ainterceptor.taila2310c.ts.net` | **fails** — Funnel was down earlier today |
-| `POST /v1/chat/completions` with `model=deepseek` (exact DSH call shape) | **200**, `content: "READY"` |
-| `GET /v1/models` | 404 (expected; not needed) |
+| `POST /v1/chat/completions` with `model=deepseek` (exact DSH call shape) | **200**, `content: "READY"` in 21.6 s |
+| `GET /v1/models` | **200** after adding the route below (was 404) |
+| `GET /v1/models` with a bogus key | 401 `invalid API key` |
 | credential reference resolves | yes, 48 chars |
 | config YAML | no tabs, consistent indentation, all keys present |
 
@@ -72,6 +73,47 @@ Transport choice: `http://100.82.62.82:8000/v1` — the **Tailscale IP**, matchi
 harness's existing default. MagicDNS (`http://ainterceptor:8000/v1`) also works and
 reads better; the Funnel URL is deliberately not used because it is public and was
 unreachable.
+
+## `/v1/models` was added to AInterceptor
+
+DSH (like any OpenAI-compatible client) discovers a route's models from
+`GET {baseURL}/models`. AInterceptor answered **404** there, which is why the
+`models:` list above had to be written by hand.
+
+`GET /v1/models` now exists, in `backend/app/api/chat_routes.py`:
+
+* returns the OpenAI list envelope; **each entry's `id` is a provider name**,
+  because AInterceptor routes on the request's `model` field
+* lists the 8 **active** providers first, then the 12 inactive ones (each marked
+  `ainterceptor.status: "inactive"` and named "<provider> (inactive)") so the
+  catalogue is visible without pretending they are usable
+* **does not require auth**, because discovery must not fail for a client that has
+  not stored a key yet — but a *supplied* header is still validated exactly as
+  `key_user` does, so a bad key returns `401 invalid API key` rather than being
+  ignored. This is why it uses a new `optional_key_user` dependency instead of
+  `key_user` (whose `Header(...)` makes the header mandatory, returning 422).
+
+Verified live on the running daemon: `200`, 20 entries; bogus key `401`;
+`/health` and `/docs` still 200; `POST /v1/chat/completions` still routes.
+
+**Note on the first attempt:** my initial version called `state.list_active()` on the
+`app.control_plane.state` *module*, which exposes only a `get_state()` singleton
+factory — that raised AttributeError and surfaced as HTTP 500. It now mirrors
+`health_routes`: `from app.control_plane.state import get_state`. Backups are kept
+at `chat_routes.py.pre_models_route` and `chat_routes.py.pre_models_statefix`.
+
+The explicit `models:` list in the DSH profile is **kept** even though discovery now
+works: it is validated and known-good, and DSH refreshes a fixed catalogue rather
+than calling discovery on every request. Enabling a *new* provider in AInterceptor
+therefore still means adding one entry to the profile.
+
+## A timing observation worth keeping
+
+`GET /v1/models` answered 200 immediately, while the **first** `POST` after a daemon
+restart took **31 s and returned 503** even though the tabs had settled. The same
+call succeeds in **21.6 s** when the stack has been idle-warm for a while. So the
+first chat request after `arestart` is not representative — warm the stack before
+judging a provider.
 
 ## Expected behaviour after DSH restarts
 
